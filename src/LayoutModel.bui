@@ -1,0 +1,109 @@
+' ============================================================
+' LayoutModel — shared in-memory model for a UI layout.
+'
+' Used by the visual layout editor (samples/ui/layout-editor.bui) and by the
+' headless round-trip engine (samples/ui/LayoutDocument.bui). Kept completely
+' UI-free so the document format can be unit-tested without opening a window.
+' This is the model behind the declarative `Window` block round-trip format
+' (docs/research/window-blocks.md).
+' ============================================================
+
+Public Enum ControlKind
+    LabelCtrl     = 0
+    ButtonCtrl    = 1
+    TextFieldCtrl = 2
+    TextAreaCtrl  = 3
+    CheckboxCtrl  = 4
+    SliderCtrl    = 5
+    ProgressCtrl  = 6
+    ComboBoxCtrl  = 7
+    ListBoxCtrl   = 8
+    ImageCtrl     = 9
+    CanvasCtrl    = 10
+    ViewCtrl      = 11
+    TabViewCtrl   = 12
+    PagePanelCtrl = 13
+End Enum
+
+' ---- A control placed on the design canvas ----
+
+Public Class DesignControl
+    Public Property Name     As String      = ""
+    Public Property Kind     As ControlKind = ControlKind.LabelCtrl
+    Public Property X        As Double      = 0.0
+    Public Property Y        As Double      = 0.0
+    Public Property W        As Double      = 100.0
+    Public Property H        As Double      = 24.0
+    Public Property Caption  As String      = ""
+    Public Property Selected As Boolean     = False
+
+    ' Control-class name as it appears in a `Control <Type> <name>` line.
+    Public Function KindName() As String
+        If Me.Kind = ControlKind.LabelCtrl     Then Return "Label"
+        If Me.Kind = ControlKind.ButtonCtrl    Then Return "Button"
+        If Me.Kind = ControlKind.TextFieldCtrl Then Return "TextField"
+        If Me.Kind = ControlKind.TextAreaCtrl  Then Return "TextArea"
+        If Me.Kind = ControlKind.CheckboxCtrl  Then Return "Checkbox"
+        If Me.Kind = ControlKind.SliderCtrl    Then Return "Slider"
+        If Me.Kind = ControlKind.ProgressCtrl  Then Return "ProgressBar"
+        If Me.Kind = ControlKind.ComboBoxCtrl  Then Return "ComboBox"
+        If Me.Kind = ControlKind.ListBoxCtrl   Then Return "ListBox"
+        If Me.Kind = ControlKind.ImageCtrl     Then Return "ImageView"
+        If Me.Kind = ControlKind.CanvasCtrl    Then Return "Canvas"
+        If Me.Kind = ControlKind.ViewCtrl      Then Return "View"
+        If Me.Kind = ControlKind.TabViewCtrl   Then Return "TabView"
+        Return "PagePanel"
+    End Function
+
+    Public Function HitTest(px As Double, py As Double) As Boolean
+        Return px >= Me.X And px <= Me.X + Me.W _
+           And py >= Me.Y And py <= Me.Y + Me.H
+    End Function
+End Class
+
+' ---- Editor state — the ordered set of placed controls plus canvas chrome ----
+
+Public Class EditorModel
+    Public Property Placed      As Array Of DesignControl
+    Public Property SelectedIdx As Integer = -1
+    Public Property CanvasW     As Double  = 480.0
+    Public Property CanvasH     As Double  = 320.0
+    Public Property GridSz      As Double  = 8.0
+    Public Property ShowGrid    As Boolean = True
+
+    Public Sub Constructor()
+        Me.Placed = []
+    End Sub
+
+    Public Function Count() As Integer
+        Return Array.Count(Me.Placed)
+    End Function
+
+    Public Function Get(i As Integer) As DesignControl
+        Dim p As Array Of DesignControl = Me.Placed
+        Return p(i)
+    End Function
+
+    Public Sub Add(ctrl As DesignControl)
+        Array.Append(Me.Placed, ctrl)
+    End Sub
+
+    Public Sub DeleteSelected()
+        If Me.SelectedIdx < 0 Then Return
+        Dim p As Array Of DesignControl = Me.Placed
+        Array.RemoveAt(p, Me.SelectedIdx)
+        Me.Placed      = p
+        Me.SelectedIdx = -1
+    End Sub
+
+    Public Function Selected() As DesignControl
+        If Me.SelectedIdx < 0 Then Return Nil
+        Dim p As Array Of DesignControl = Me.Placed
+        Return p(Me.SelectedIdx)
+    End Function
+
+    Public Function Snap(v As Double) As Double
+        If Me.GridSz <= 0.0 Then Return v
+        Return Math.Round(v / Me.GridSz) * Me.GridSz
+    End Function
+End Class

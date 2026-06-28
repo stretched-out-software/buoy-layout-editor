@@ -1,0 +1,1120 @@
+' ============================================================
+' Buoy Layout Editor
+' A WYSIWYG form designer written in Buoy.
+'
+' Three-panel layout:
+'   Left   — Control Library (ListBox + search field)
+'   Center — Design Canvas   (Canvas with grid, drag-to-move, arrow-nudge)
+'   Right  — Property Editor (two-column ListBox; edit value cells inline)
+'
+' Interaction:
+'   Select a control in the library, click Add → places it on the canvas
+'   Click a placed control → selects it, shows its properties on the right
+'   Drag a placed control → moves it (snaps to grid)
+'   Arrow keys → nudge selected control by one grid step
+'   Delete/Backspace → remove selected control
+'   Edit a value cell in the property panel → updates control on FocusLost
+' ============================================================
+
+' The layout model (ControlKind, DesignControl, EditorModel) and the round-trip
+' engine (LayoutDoc, EmitWindow/ParseWindow, Save/LoadLayout) live in sibling
+' modules so they are shared with the headless tests. They resolve from this
+' file's own directory at build time.
+Import LayoutModel
+Import LayoutDocument
+
+Const globalFontName = "Arial"
+Const globalFontSize = 13.0
+Const globalBoldFontName = "Arial Black"
+Const globalBoldFontSize = 13.0
+
+' DesignControl (a control placed on the design canvas) and EditorModel (the
+' editor's document) are defined in the shared LayoutModel module imported above.
+
+' ---- An entry in the control library panel ----
+
+Class LibraryEntry
+    Public Property Caption  As String      = ""
+    Public Property Kind     As ControlKind = ControlKind.LabelCtrl
+    Public Property IsHeader As Boolean     = False
+    Public Property DefaultW As Double      = 100.0
+    Public Property DefaultH As Double      = 24.0
+End Class
+
+' ---- A row in the property editor ----
+
+Class PropRow
+    Public Property PropName As String  = ""
+    Public Property Value    As String  = ""
+    Public Property IsRO     As Boolean = False
+End Class
+
+' ---- Shared document state (current file path + window class name) ----
+
+Class DocState
+    Public Property CurrentPath As String  = ""
+    Public Property WindowName  As String  = "MainWindow"
+    Public Property IsModified  As Boolean = False
+End Class
+
+' ============================================================
+' Editor state — single source of truth passed to all panels
+' ============================================================
+
+' ============================================================
+' Library panel — ListBoxDataSource
+' ============================================================
+
+Class LibrarySource Inherits ListBoxDataSource
+    Public Property Entries As Array Of LibraryEntry
+    Public Property Filter  As String = ""
+
+    Public Sub Constructor()
+        Me.Entries = []
+        Me.Rebuild()
+    End Sub
+
+    Public Sub SetFilter(text As String)
+        Me.Filter = text
+        Me.Rebuild()
+    End Sub
+
+    Private Sub Rebuild()
+        Array.Clear(Me.Entries)
+        Me.PutHeader("Built-in Controls")
+        Me.PutEntry("Label",       ControlKind.LabelCtrl,     120.0,  20.0)
+        Me.PutEntry("Button",      ControlKind.ButtonCtrl,    100.0,  32.0)
+        Me.PutEntry("TextField",   ControlKind.TextFieldCtrl, 200.0,  26.0)
+        Me.PutEntry("TextArea",    ControlKind.TextAreaCtrl,  200.0, 100.0)
+        Me.PutEntry("Checkbox",    ControlKind.CheckboxCtrl,  150.0,  24.0)
+        Me.PutEntry("Slider",      ControlKind.SliderCtrl,    200.0,  24.0)
+        Me.PutEntry("ProgressBar", ControlKind.ProgressCtrl,  200.0,  20.0)
+        Me.PutEntry("ComboBox",    ControlKind.ComboBoxCtrl,  160.0,  26.0)
+        Me.PutEntry("ListBox",     ControlKind.ListBoxCtrl,   200.0, 150.0)
+        Me.PutEntry("ImageView",   ControlKind.ImageCtrl,     100.0, 100.0)
+        Me.PutEntry("Canvas",      ControlKind.CanvasCtrl,    200.0, 150.0)
+        Me.PutEntry("View",        ControlKind.ViewCtrl,      200.0, 150.0)
+        Me.PutEntry("TabView",     ControlKind.TabViewCtrl,   300.0, 200.0)
+        Me.PutEntry("PagePanel",   ControlKind.PagePanelCtrl, 300.0, 200.0)
+        Me.PutHeader("Project Controls")
+    End Sub
+
+    Private Sub PutHeader(caption As String)
+        Dim e As LibraryEntry = New LibraryEntry()
+        e.Caption  = caption
+        e.IsHeader = True
+        Array.Append(Me.Entries, e)
+    End Sub
+
+    Private Sub PutEntry(caption As String, kind As ControlKind, dw As Double, dh As Double)
+        If String.Len(Me.Filter) > 0 Then
+            If Not String.Contains(String.LCase(caption), String.LCase(Me.Filter)) Then Return
+        End If
+        Dim e As LibraryEntry = New LibraryEntry()
+        e.Caption  = caption
+        e.Kind     = kind
+        e.DefaultW = dw
+        e.DefaultH = dh
+        Array.Append(Me.Entries, e)
+    End Sub
+
+    Public Function EntryAt(i As Integer) As LibraryEntry
+        Dim arr As Array Of LibraryEntry = Me.Entries
+        Return arr(i)
+    End Function
+
+    Public Overrides Function RowCount() As Integer
+        Return Array.Count(Me.Entries)
+    End Function
+
+    Public Overrides Sub SetupCell(cell As ListBoxCell, column As Integer)
+        Dim lbl As Label = New Label()
+        lbl.Move(8, 4, 188, 20)
+        cell.AddSubview(lbl)
+    End Sub
+
+    Public Overrides Sub BindCell(cell As ListBoxCell, row As Integer, column As Integer)
+        Dim lbl  As Label       = CType(cell.Subview(0), Label)
+        Dim arr  As Array Of LibraryEntry = Me.Entries
+        Dim e    As LibraryEntry = arr(row)
+        lbl.Text = e.Caption
+        If e.IsHeader Then
+            lbl.FontName = globalBoldFontName
+            lbl.FontSize = globalBoldFontSize
+        Else
+            lbl.FontName = globalfontName
+            lbl.FontSize = globalFontSize
+        End If
+    End Sub
+End Class
+
+' ============================================================
+' Property value TextField — pushes edits back on FocusLost.
+' PropSource passes itself and shared refs via SetupCell;
+' BindCell sets RowIdx so the field knows which property it
+' represents when the user tabs away.
+' ============================================================
+
+Class PropValueField Inherits TextField
+    Public Property RowIdx  As Integer      = -1
+    Public Property PropSrc As PropSource   = Nil
+    Public Property Model   As EditorModel  = Nil
+    Public Property Surface As DesignCanvas = Nil
+    Public Property Status  As Label        = Nil
+
+    Handle FocusLost()
+        If Me.Model   = Nil Then Return
+        If Me.PropSrc = Nil Then Return
+        If Me.RowIdx < 0 Then Return
+        Dim ctrl As DesignControl = Me.Model.Selected()   ' Nil when editing canvas props
+        Dim r As PropRow = Me.PropSrc.RowAt(Me.RowIdx)
+        If r.IsRO Then Return
+        Me.PropSrc.ApplyEdit(ctrl, r.PropName, Me.Text)
+        If Me.Surface <> Nil Then Me.Surface.Invalidate()
+        If Me.Status  <> Nil Then Me.Status.Text = "Set " + r.PropName + " = " + Me.Text
+    End Handle
+End Class
+
+' ============================================================
+' Property panel — ListBoxDataSource (two columns)
+' ============================================================
+
+Class PropSource Inherits ListBoxDataSource
+    Public Property Rows    As Array Of PropRow
+    Public Property Model   As EditorModel  = Nil
+    Public Property Surface As DesignCanvas = Nil
+    Public Property Status  As Label        = Nil
+    Public Property Doc     As DocState     = Nil
+
+    Public Sub Constructor()
+        Me.Rows = []
+    End Sub
+
+    Public Sub Load(ctrl As DesignControl)
+        Array.Clear(Me.Rows)
+        If ctrl = Nil Then
+            ' No control selected — show document and canvas properties.
+            Dim wn As String = "MainWindow"
+            If Me.Doc <> Nil Then wn = Me.Doc.WindowName
+            Me.Put("Window Name",   wn,                                        False)
+            Me.Put("Canvas Width",  String.From(Math.Round(Me.Model.CanvasW)), False)
+            Me.Put("Canvas Height", String.From(Math.Round(Me.Model.CanvasH)), False)
+            Return
+        End If
+        Me.Put("Name",    ctrl.Name,                              False)
+        Me.Put("Kind",    ctrl.KindName(),                        True)
+        Me.Put("X",       String.From(Math.Round(ctrl.X)),        False)
+        Me.Put("Y",       String.From(Math.Round(ctrl.Y)),        False)
+        Me.Put("Width",   String.From(Math.Round(ctrl.W)),        False)
+        Me.Put("Height",  String.From(Math.Round(ctrl.H)),        False)
+        Me.Put("Caption", ctrl.Caption,                           False)
+    End Sub
+
+    Private Sub Put(propName As String, value As String, isRO As Boolean)
+        Dim r As PropRow = New PropRow()
+        r.PropName = propName
+        r.Value    = value
+        r.IsRO     = isRO
+        Array.Append(Me.Rows, r)
+    End Sub
+
+    Public Function RowAt(i As Integer) As PropRow
+        Dim arr As Array Of PropRow = Me.Rows
+        Return arr(i)
+    End Function
+
+    Public Sub ApplyEdit(ctrl As DesignControl, propName As String, value As String)
+        If Me.Doc <> Nil Then Me.Doc.IsModified = True
+        If ctrl = Nil Then
+            If propName = "Window Name"   Then If Me.Doc <> Nil Then Me.Doc.WindowName = value
+            If propName = "Canvas Width"  Then Me.Model.CanvasW = Double.Parse(value).Or(Me.Model.CanvasW)
+            If propName = "Canvas Height" Then Me.Model.CanvasH = Double.Parse(value).Or(Me.Model.CanvasH)
+            Return
+        End If
+        If propName = "Name"    Then ctrl.Name    = value
+        If propName = "X"       Then ctrl.X       = Double.Parse(value).Or(ctrl.X)
+        If propName = "Y"       Then ctrl.Y       = Double.Parse(value).Or(ctrl.Y)
+        If propName = "Width"   Then ctrl.W       = Double.Parse(value).Or(ctrl.W)
+        If propName = "Height"  Then ctrl.H       = Double.Parse(value).Or(ctrl.H)
+        If propName = "Caption" Then ctrl.Caption = value
+    End Sub
+
+    Public Overrides Function RowCount() As Integer
+        Return Array.Count(Me.Rows)
+    End Function
+
+    Public Overrides Sub SetupCell(cell As ListBoxCell, column As Integer)
+        If column = 0 Then
+            Dim lbl As Label = New Label()
+            lbl.Move(6, 4, 108, 20)
+            lbl.FontName = globalFontName
+            lbl.FontSize = 12.0
+            cell.AddSubview(lbl)
+        Else
+            Dim fld As PropValueField = New PropValueField()
+            fld.Model   = Me.Model
+            fld.PropSrc = Me
+            fld.Surface = Me.Surface
+            fld.Status  = Me.Status
+            fld.Move(2, 2, 152, 22)
+            cell.AddSubview(fld)
+        End If
+    End Sub
+
+    Public Overrides Sub BindCell(cell As ListBoxCell, row As Integer, column As Integer)
+        Dim arr As Array Of PropRow = Me.Rows
+        Dim r   As PropRow = arr(row)
+        If column = 0 Then
+            Dim lbl As Label = CType(cell.Subview(0), Label)
+            lbl.Text = r.PropName
+        Else
+            Dim fld As PropValueField = CType(cell.Subview(0), PropValueField)
+            fld.Text       = r.Value
+            fld.IsReadOnly = r.IsRO
+            fld.RowIdx     = row
+        End If
+    End Sub
+End Class
+
+' ============================================================
+' Design Canvas — WYSIWYG rendering + mouse/keyboard interaction
+' ============================================================
+
+Class DesignCanvas Inherits Canvas
+    Public Property Model    As EditorModel = Nil
+    Public Property PropSrc  As PropSource  = Nil
+    Public Property PropList As ListBox     = Nil
+    Public Property Status   As Label       = Nil
+    Public Property Doc      As DocState    = Nil
+
+    Public Property DragActive As Boolean = False
+    Public Property DragIdx    As Integer = -1
+    Public Property DragOX     As Double  = 0.0
+    Public Property DragOY     As Double  = 0.0
+
+    Handle Paint(g As Graphics)
+        Dim sw As Double = Me.Width
+        Dim sh As Double = Me.Height
+        Dim ox As Double = 24.0
+        Dim oy As Double = 24.0
+        Dim cw As Double = Me.Model.CanvasW
+        Dim ch As Double = Me.Model.CanvasH
+
+        g.ClipToRect(0.0, 0.0, sw, sh)
+        g.FillRect(0.0, 0.0, sw, sh, Color.RGB(0.72, 0.72, 0.72))
+        g.FillRect(ox + 5.0, oy + 5.0, cw, ch, Color.RGBA(0.0, 0.0, 0.0, 0.22))
+        g.FillRect(ox, oy, cw, ch, Color.White)
+
+        If Me.Model.ShowGrid Then
+            Dim gs As Double = Me.Model.GridSz
+            Dim gx As Double = ox + gs
+            Do While gx < ox + cw
+                g.DrawLine(gx, oy, gx, oy + ch, 0.5, Color.RGBA(0.55, 0.55, 0.85, 0.28))
+                gx = gx + gs
+            Loop
+            Dim gy As Double = oy + gs
+            Do While gy < oy + ch
+                g.DrawLine(ox, gy, ox + cw, gy, 0.5, Color.RGBA(0.55, 0.55, 0.85, 0.28))
+                gy = gy + gs
+            Loop
+        End If
+
+        Dim i As Integer = 0
+        Do While i < Me.Model.Count()
+            Me.DrawCtrl(g, Me.Model.Get(i), ox, oy)
+            i = i + 1
+        Loop
+
+        g.StrokeRect(ox, oy, cw, ch, 1.0, Color.RGBA(0.0, 0.0, 0.0, 0.4))
+    End Handle
+
+    Private Sub DrawCtrl(g As Graphics, c As DesignControl, ox As Double, oy As Double)
+        Dim x As Double = ox + c.X
+        Dim y As Double = oy + c.Y
+        Dim w As Double = c.W
+        Dim h As Double = c.H
+        Dim border As Color = Color.RGBA(0.5, 0.5, 0.5, 0.9)
+        If c.Selected Then border = Color.RGBA(0.08, 0.48, 1.0, 1.0)
+
+        If c.Kind = ControlKind.LabelCtrl Then
+            Dim txt As String = c.Caption
+            If String.Len(txt) = 0 Then txt = c.Name
+            dim txtHeight as Double = g.MeasureStringHeight(txt, globalFontName, globalFontSize)
+            g.DrawString(txt, x, y + h * 0.5 + txtHeight * 0.5, globalFontName, globalFontSize, Color.Black)
+            If c.Selected Then Me.DrawHandles(g, x, y, w, h)
+            Return
+        End If
+
+        If c.Kind = ControlKind.ButtonCtrl Then
+            g.FillRoundedRect(x, y, w, h, 5.0, Color.RGBA(0.83, 0.83, 0.83, 1.0))
+            g.StrokeRoundedRect(x, y, w, h, 5.0, 1.0, border)
+            Dim btnLbl As String = c.Caption
+            If String.Len(btnLbl) = 0 Then btnLbl = "Button"
+            Dim tw As Double = g.MeasureStringWidth(btnLbl, globalFontName, globalFontSize)
+            dim txtHeight as Double = g.MeasureStringHeight(btnLbl, globalFontName, globalFontSize)
+            g.DrawString(btnLbl, x + (w - tw) * 0.5, y + h * 0.5 + txtHeight * 0.5, globalFontName, globalFontSize, Color.Black)
+            If c.Selected Then Me.DrawHandles(g, x, y, w, h)
+            Return
+        End If
+
+        If c.Kind = ControlKind.TextFieldCtrl Then
+            g.FillRoundedRect(x, y, w, h, 3.0, Color.White)
+            g.StrokeRoundedRect(x, y, w, h, 3.0, 1.0, border)
+            Dim ph As String = c.Caption
+            If String.Len(ph) = 0 Then ph = "Text field..."
+            dim txtHeight as Double = g.MeasureStringHeight(ph, globalFontName, 12.0)
+            g.DrawString(ph, x + 6.0, y + h * 0.5 + txtHeight * 0.5, globalFontName, 12.0, _
+                         Color.RGBA(0.6, 0.6, 0.6, 1.0))
+            If c.Selected Then Me.DrawHandles(g, x, y, w, h)
+            Return
+        End If
+
+        If c.Kind = ControlKind.TextAreaCtrl Then
+            g.FillRoundedRect(x, y, w, h, 3.0, Color.White)
+            g.StrokeRoundedRect(x, y, w, h, 3.0, 1.0, border)
+            dim txtHeight as Double = g.MeasureStringHeight("Text area", globalFontName, 12.0)
+            g.DrawString("Text area", x + 6.0, y + txtHeight, globalFontName, 12.0, _
+                         Color.RGBA(0.6, 0.6, 0.6, 1.0))
+            If c.Selected Then Me.DrawHandles(g, x, y, w, h)
+            Return
+        End If
+
+        If c.Kind = ControlKind.CheckboxCtrl Then
+            Dim bby As Double = y + h * 0.5 - 8.0
+            g.FillRect(x, bby, 16.0, 16.0, Color.White)
+            g.StrokeRect(x, bby, 16.0, 16.0, 1.0, border)
+            Dim chkLbl As String = c.Caption
+            dim txtHeight as Double = g.MeasureStringHeight(chkLbl, globalFontName, globalFontSize)
+            If String.Len(chkLbl) = 0 Then chkLbl = "Checkbox"
+            g.DrawString(chkLbl, x + 22.0, y + h * 0.5 + txtHeight * 0.5, globalFontName, globalFontSize, Color.Black)
+            If c.Selected Then Me.DrawHandles(g, x, y, w, h)
+            Return
+        End If
+
+        If c.Kind = ControlKind.SliderCtrl Then
+            g.FillRoundedRect(x, y + h * 0.5 - 3.0, w, 6.0, 3.0, Color.RGBA(0.7, 0.7, 0.7, 1.0))
+            g.FillOval(x + w * 0.5 - 8.0, y + h * 0.5 - 8.0, 16.0, 16.0, Color.White)
+            g.StrokeOval(x + w * 0.5 - 8.0, y + h * 0.5 - 8.0, 16.0, 16.0, 1.0, border)
+            If c.Selected Then Me.DrawHandles(g, x, y, w, h)
+            Return
+        End If
+
+        If c.Kind = ControlKind.ProgressCtrl Then
+            g.FillRoundedRect(x, y + h * 0.5 - 4.0, w, 8.0, 4.0, Color.RGBA(0.85, 0.85, 0.85, 1.0))
+            g.FillRoundedRect(x, y + h * 0.5 - 4.0, w * 0.6, 8.0, 4.0, Color.RGBA(0.18, 0.5, 0.9, 1.0))
+            If c.Selected Then Me.DrawHandles(g, x, y, w, h)
+            Return
+        End If
+
+        If c.Kind = ControlKind.ComboBoxCtrl Then
+            g.FillRoundedRect(x, y, w, h, 3.0, Color.White)
+            g.StrokeRoundedRect(x, y, w, h, 3.0, 1.0, border)
+            dim txtHeight as Double = g.MeasureStringHeight("Select...", globalFontName, 12.0)
+            g.DrawString("Select...", x + 6.0, y + h * 0.5 + txtHeight * 0.5, globalFontName, 12.0, _
+                         Color.RGBA(0.6, 0.6, 0.6, 1.0))
+
+            txtHeight = g.MeasureStringHeight("v", globalFontName, globalBoldFontSize)
+            g.DrawString("v", x + w - 16.0, y + h * 0.5 + txtHeight * 0.5, globalFontName, globalBoldFontSize, _
+                         Color.RGBA(0.4, 0.4, 0.4, 1.0))
+            If c.Selected Then Me.DrawHandles(g, x, y, w, h)
+            Return
+        End If
+
+        ' Generic: ListBox / ImageView / Canvas / View / TabView / PagePanel
+        g.FillRoundedRect(x, y, w, h, 3.0, Color.RGBA(0.93, 0.93, 0.97, 1.0))
+        g.StrokeRoundedRect(x, y, w, h, 3.0, 1.0, border)
+        Dim badge As String = "[" + c.KindName() + "]"
+        g.DrawString(badge, x + 6.0, y + 6.0, globalFontName, 10.0, Color.RGBA(0.45, 0.45, 0.55, 1.0))
+        If String.Len(c.Caption) > 0 Then
+            g.DrawString(c.Caption, x + 6.0, y + 22.0, globalFontName, 12.0, Color.RGBA(0.2, 0.2, 0.2, 1.0))
+        End If
+        If c.Selected Then Me.DrawHandles(g, x, y, w, h)
+    End Sub
+
+    Private Sub DrawHandles(g As Graphics, x As Double, y As Double, w As Double, h As Double)
+        Me.DrawHandle(g, x,           y)
+        Me.DrawHandle(g, x + w * 0.5, y)
+        Me.DrawHandle(g, x + w,       y)
+        Me.DrawHandle(g, x + w,       y + h * 0.5)
+        Me.DrawHandle(g, x + w,       y + h)
+        Me.DrawHandle(g, x + w * 0.5, y + h)
+        Me.DrawHandle(g, x,           y + h)
+        Me.DrawHandle(g, x,           y + h * 0.5)
+    End Sub
+
+    Private Sub DrawHandle(g As Graphics, cx As Double, cy As Double)
+        g.FillRect(cx - 4.0, cy - 4.0, 8.0, 8.0, Color.White)
+        g.StrokeRect(cx - 4.0, cy - 4.0, 8.0, 8.0, 1.0, Color.RGBA(0.08, 0.48, 1.0, 1.0))
+    End Sub
+
+    Handle MouseDown(e As MouseEvent)
+        Dim cx As Double = e.X - 24.0
+        Dim cy As Double = e.Y - 24.0
+
+        If Me.Model.SelectedIdx >= 0 Then
+            Me.Model.Get(Me.Model.SelectedIdx).Selected = False
+        End If
+        Me.Model.SelectedIdx = -1
+
+        Dim i As Integer = Me.Model.Count() - 1
+        Do While i >= 0
+            If Me.Model.SelectedIdx < 0 Then
+                If Me.Model.Get(i).HitTest(cx, cy) Then
+                    Me.Model.SelectedIdx = i
+                End If
+            End If
+            i = i - 1
+        Loop
+
+        If Me.Model.SelectedIdx >= 0 Then
+            Dim sel As DesignControl = Me.Model.Get(Me.Model.SelectedIdx)
+            sel.Selected  = True
+            Me.DragActive = True
+            Me.DragIdx    = Me.Model.SelectedIdx
+            Me.DragOX     = cx - sel.X
+            Me.DragOY     = cy - sel.Y
+            Me.Focus()
+        End If
+
+        Me.SyncProperties()
+        Me.Invalidate()
+    End Handle
+
+    Handle MouseDrag(e As MouseEvent)
+        If Not Me.DragActive Then Return
+        Dim ctrl As DesignControl = Me.Model.Get(Me.DragIdx)
+        ctrl.X = Me.Model.Snap(e.X - 24.0 - Me.DragOX)
+        ctrl.Y = Me.Model.Snap(e.Y - 24.0 - Me.DragOY)
+        If Me.Doc <> Nil Then Me.Doc.IsModified = True
+        Me.UpdateStatus()
+        Me.Invalidate()
+    End Handle
+
+    Handle MouseUp(e As MouseEvent)
+        If Me.DragActive Then
+            Me.DragActive = False
+            Me.SyncProperties()
+        End If
+    End Handle
+
+    Handle KeyDown(e As KeyEvent)
+        If e.Key = KeyName.Delete Or e.Key = KeyName.Backspace Then
+            Me.Model.DeleteSelected()
+            If Me.Doc <> Nil Then Me.Doc.IsModified = True
+            Me.SyncProperties()
+            Me.Invalidate()
+            Return
+        End If
+        Dim ctrl As DesignControl = Me.Model.Selected()
+        If ctrl <> Nil Then
+            If e.Key = KeyName.Left  Then ctrl.X = ctrl.X - Me.Model.GridSz
+            If e.Key = KeyName.Right Then ctrl.X = ctrl.X + Me.Model.GridSz
+            If e.Key = KeyName.Up    Then ctrl.Y = ctrl.Y - Me.Model.GridSz
+            If e.Key = KeyName.Down  Then ctrl.Y = ctrl.Y + Me.Model.GridSz
+            If Me.Doc <> Nil Then Me.Doc.IsModified = True
+            Me.UpdateStatus()
+            Me.Invalidate()
+        End If
+    End Handle
+
+    Public Sub SyncProperties()
+        If Me.PropSrc = Nil Or Me.PropList = Nil Then Return
+        Me.PropSrc.Load(Me.Model.Selected())
+        Me.PropList.ReloadData()
+        Me.UpdateStatus()
+    End Sub
+
+    Private Sub UpdateStatus()
+        If Me.Status = Nil Then Return
+        Dim ctrl As DesignControl = Me.Model.Selected()
+        If ctrl = Nil Then
+            Me.Status.Text = "No selection — click a placed control, or pick one in the library and click Add."
+        Else
+            Me.Status.Text = ctrl.Name + " (" + ctrl.KindName() + ")" + _
+                "  X:"  + String.From(Math.Round(ctrl.X)) + _
+                "  Y:"  + String.From(Math.Round(ctrl.Y)) + _
+                "  W:"  + String.From(Math.Round(ctrl.W)) + _
+                "  H:"  + String.From(Math.Round(ctrl.H))
+        End If
+    End Sub
+End Class
+
+' ============================================================
+' Toolbar controls — wired via Public Property back-references
+' (same pattern as click-counter.bui)
+' ============================================================
+
+Class AddCtrlButton Inherits Button
+    Public Property LibSrc   As LibrarySource = Nil
+    Public Property LibList  As ListBox       = Nil
+    Public Property Model    As EditorModel   = Nil
+    Public Property Surface  As DesignCanvas  = Nil
+    Public Property PropSrc  As PropSource    = Nil
+    Public Property PropList As ListBox       = Nil
+    Public Property Status   As Label         = Nil
+    Public Property Doc      As DocState      = Nil
+
+    Handle Action()
+        If Me.LibList = Nil Then Return
+        Dim row As Integer = Me.LibList.SelectedRow
+        If row < 0 Then
+            If Me.Status <> Nil Then Me.Status.Text = "Select a control type in the library first."
+            Return
+        End If
+        Dim entry As LibraryEntry = Me.LibSrc.EntryAt(row)
+        If entry.IsHeader Then
+            If Me.Status <> Nil Then Me.Status.Text = "Select an individual control, not a section header."
+            Return
+        End If
+
+        If Me.Model.SelectedIdx >= 0 Then
+            Me.Model.Get(Me.Model.SelectedIdx).Selected = False
+        End If
+
+        Dim ctrl As DesignControl = New DesignControl()
+        ctrl.Kind     = entry.Kind
+        ctrl.Name     = entry.Caption + String.From(Me.Model.Count() + 1)
+        ctrl.Caption  = entry.Caption
+        ctrl.X        = 20.0
+        ctrl.Y        = 20.0
+        ctrl.W        = entry.DefaultW
+        ctrl.H        = entry.DefaultH
+        ctrl.Selected = True
+
+        Me.Model.Add(ctrl)
+        Me.Model.SelectedIdx = Me.Model.Count() - 1
+        If Me.Doc <> Nil Then Me.Doc.IsModified = True
+
+        Me.PropSrc.Load(ctrl)
+        Me.PropList.ReloadData()
+        If Me.Status <> Nil Then Me.Status.Text = "Added " + ctrl.Name + " — drag to position it."
+        Me.Surface.Invalidate()
+    End Handle
+End Class
+
+Class DeleteCtrlButton Inherits Button
+    Public Property Model    As EditorModel  = Nil
+    Public Property Surface  As DesignCanvas = Nil
+    Public Property PropSrc  As PropSource   = Nil
+    Public Property PropList As ListBox      = Nil
+    Public Property Status   As Label        = Nil
+    Public Property Doc      As DocState     = Nil
+
+    Handle Action()
+        If Me.Model.SelectedIdx < 0 Then
+            If Me.Status <> Nil Then Me.Status.Text = "Nothing selected."
+            Return
+        End If
+        Me.Model.DeleteSelected()
+        If Me.Doc <> Nil Then Me.Doc.IsModified = True
+        Me.PropSrc.Load(Nil)
+        Me.PropList.ReloadData()
+        If Me.Status <> Nil Then Me.Status.Text = "Control deleted."
+        Me.Surface.Invalidate()
+    End Handle
+End Class
+
+Class LibSearchField Inherits TextField
+    Public Property LibSrc  As LibrarySource = Nil
+    Public Property LibList As ListBox       = Nil
+
+    Handle TextChanged()
+        If Me.LibSrc = Nil Then Return
+        Me.LibSrc.SetFilter(Me.Text)
+        Me.LibList.ReloadData()
+    End Handle
+End Class
+
+' ============================================================
+' Library ListBox — double-click adds the control, same logic as AddCtrlButton.
+' ============================================================
+
+Class LibListBox Inherits ListBox
+    Public Property LibSrc   As LibrarySource = Nil
+    Public Property Model    As EditorModel   = Nil
+    Public Property Surface  As DesignCanvas  = Nil
+    Public Property PropSrc  As PropSource    = Nil
+    Public Property PropList As ListBox       = Nil
+    Public Property Status   As Label         = Nil
+    Public Property Doc      As DocState      = Nil
+
+    Handle DoubleClick(e As MouseEvent)
+        Dim row As Integer = Me.SelectedRow
+        If row < 0 Then Return
+        Dim entry As LibraryEntry = Me.LibSrc.EntryAt(row)
+        If entry.IsHeader Then Return
+
+        If Me.Model.SelectedIdx >= 0 Then
+            Me.Model.Get(Me.Model.SelectedIdx).Selected = False
+        End If
+
+        Dim ctrl As DesignControl = New DesignControl()
+        ctrl.Kind     = entry.Kind
+        ctrl.Name     = entry.Caption + String.From(Me.Model.Count() + 1)
+        ctrl.Caption  = entry.Caption
+        ctrl.X        = 20.0
+        ctrl.Y        = 20.0
+        ctrl.W        = entry.DefaultW
+        ctrl.H        = entry.DefaultH
+        ctrl.Selected = True
+
+        Me.Model.Add(ctrl)
+        Me.Model.SelectedIdx = Me.Model.Count() - 1
+        If Me.Doc <> Nil Then Me.Doc.IsModified = True
+
+        Me.PropSrc.Load(ctrl)
+        Me.PropList.ReloadData()
+        If Me.Status <> Nil Then Me.Status.Text = "Added " + ctrl.Name + " — drag to position it."
+        Me.Surface.Invalidate()
+    End Handle
+End Class
+
+Class GridCheckbox Inherits Checkbox
+    Public Property Model   As EditorModel  = Nil
+    Public Property Surface As DesignCanvas = Nil
+
+    Handle ValueChanged()
+        If Me.Model = Nil Then Return
+        Me.Model.ShowGrid = (Me.Value = CheckState.True)
+        If Me.Surface <> Nil Then Me.Surface.Invalidate()
+    End Handle
+End Class
+
+' ============================================================
+' Main Window
+' ============================================================
+
+Class LayoutEditorWindow Inherits Window
+    ' Document references, wired in Main() so the File menu can act on the layout.
+    Public Property App       As LayoutEditorApp = Nil
+    Public Property Model     As EditorModel  = Nil
+    Public Property Surface   As DesignCanvas = Nil
+    Public Property PropSrc   As PropSource   = Nil
+    Public Property PropList  As ListBox      = Nil
+    Public Property Status    As Label        = Nil
+    Public Property Doc       As DocState     = Nil
+
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.Layout(width, height)
+    End Handle
+
+    Handle MenuSelected(item As MenuItem)
+        Me.App?.HandleMenuItem(item.Tag)
+    End Handle
+
+    Handle Closed()
+        Me.App?.CurrentWindow = Nil
+    End Handle
+
+    Private Sub SetStatus(msg As String)
+        If Me.Status <> Nil Then Me.Status.Text = msg
+    End Sub
+
+    Private Sub UpdateTitle()
+        If Me.Doc = Nil Or Me.Doc.CurrentPath = "" Then
+            Me.Title = "Buoy Layout Editor"
+            Return
+        End If
+        Dim filename As String = New FileSystemItem(Me.Doc.CurrentPath).Name()
+        Me.Title = filename + " — Buoy Layout Editor"
+    End Sub
+
+    ' Show an Open dialog and load the chosen layout into the editor model.
+    Public Sub DoOpen()
+        ' If there are unsaved changes, ask before discarding them.
+        If Me.Doc <> Nil Then
+            If Me.Doc.IsModified Then
+                Dim choice As String = MessageBox.Show(Me, "Save before opening?", _
+                    "The current layout has unsaved changes.", "Yes", "No", "Cancel")
+                If choice = "Cancel" Or choice = "" Then Return
+                If choice = "Yes" Then
+                    Me.DoSave()
+                    ' If the save was cancelled (still modified), abort the open.
+                    If Me.Doc.IsModified Then Return
+                End If
+            End If
+        End If
+
+        Dim dlg As OpenFileDialog = New OpenFileDialog()
+        dlg.Title = "Open Layout"
+        dlg.AddFilter("Buoy Layout Files", "*.bui")
+        dlg.AddFilter("All Files", "*")
+        If Not dlg.Show(Me) Then Return
+        Dim filePath As String = dlg.SelectedPath
+        Dim ld As LayoutDoc = LayoutDocument.LoadLayout(filePath)
+        If Not ld.Success Then
+            Me.SetStatus("Open failed: " + ld.ErrMsg)
+            Return
+        End If
+        If Me.Model <> Nil Then
+            Me.Model.Placed      = ld.Model.Placed
+            Me.Model.SelectedIdx = -1
+            Me.Model.CanvasW     = ld.WinW
+            Me.Model.CanvasH     = ld.WinH
+        End If
+        If Me.Doc <> Nil Then
+            Me.Doc.CurrentPath = filePath
+            Me.Doc.WindowName  = ld.WindowName
+            Me.Doc.IsModified  = False
+        End If
+        If Me.PropSrc  <> Nil Then Me.PropSrc.Load(Nil)
+        If Me.PropList <> Nil Then Me.PropList.ReloadData()
+        If Me.Surface  <> Nil Then Me.Surface.Invalidate()
+        Me.UpdateTitle()
+        Me.SetStatus("Opened " + filePath + " (" + String.From(Me.Model.Count()) + " controls).")
+    End Sub
+
+    ' Save to the current document path, or fall back to Save As if none yet.
+    Public Sub DoSave()
+        If Me.Doc <> Nil Then
+            If Me.Doc.CurrentPath <> "" Then
+                Me.SaveTo(Me.Doc.CurrentPath)
+                Return
+            End If
+        End If
+        Me.DoSaveAs()
+    End Sub
+
+    ' Show a Save As dialog and save the layout to the chosen path.
+    Public Sub DoSaveAs()
+        Dim dlg As SaveFileDialog = New SaveFileDialog()
+        dlg.Title = "Save Layout As"
+        dlg.DefaultExtension = "bui"
+        dlg.AddFilter("Buoy Layout Files", "*.bui")
+        dlg.AddFilter("All Files", "*")
+        If Not dlg.Show(Me) Then Return
+        Me.SaveTo(dlg.SelectedPath)
+    End Sub
+
+    Private Sub SaveTo(filePath As String)
+        If Me.Model = Nil Then Return
+        Dim wn As String = "MainWindow"
+        If Me.Doc <> Nil Then
+            If Me.Doc.WindowName <> "" Then wn = Me.Doc.WindowName
+        End If
+        Dim out As LayoutDoc = New LayoutDoc()
+        out.WindowName   = wn
+        out.WindowTitle  = wn
+        out.WinW         = Me.Model.CanvasW
+        out.WinH         = Me.Model.CanvasH
+        out.Model.Placed = Me.Model.Placed
+        Dim r As Result Of Integer, String = LayoutDocument.SaveLayout(filePath, out)
+        If r.IsOk Then
+            If Me.Doc <> Nil Then
+                Me.Doc.CurrentPath = filePath
+                Me.Doc.WindowName  = wn
+                Me.Doc.IsModified  = False
+            End If
+            Me.UpdateTitle()
+            Me.SetStatus("Saved " + String.From(Me.Model.Count()) + " controls to " + filePath)
+        Else
+            Me.SetStatus("Save failed: " + r.Error)
+        End If
+    End Sub
+
+End Class
+
+' ============================================================
+' Application subclass — handles menu actions at the app level so they work
+' on macOS even when no window is open, and centralises the dispatch logic
+' so the per-window MenuSelected handler can simply delegate here.
+' ============================================================
+
+Class LayoutEditorApp Inherits Application
+    Public Property CurrentWindow As LayoutEditorWindow = Nil
+
+    Handle MenuSelected(item As MenuItem)
+        Me.HandleMenuItem(item.Tag)
+    End Handle
+
+    Public Sub HandleMenuItem(tag As String)
+        If tag = "quit" Then Application.Quit()
+        If tag = "open" Then Me.EnsureWindow().DoOpen()
+        If tag = "save" Then
+            If Me.CurrentWindow <> Nil Then Me.CurrentWindow.DoSave()
+        End If
+        If tag = "saveas" Then
+            If Me.CurrentWindow <> Nil Then Me.CurrentWindow.DoSaveAs()
+        End If
+    End Sub
+
+    Public Function EnsureWindow() As LayoutEditorWindow
+        If Me.CurrentWindow = Nil Then
+            Me.CurrentWindow = CreateEditorWindow(Me)
+            Me.CurrentWindow.Layout(980.0, 700.0)
+            Me.CurrentWindow.Show()
+        End If
+        Return Me.CurrentWindow
+    End Function
+End Class
+
+' ============================================================
+' Entry point — builds and wires the editor.
+' All controls are added directly to the window so anchor
+' constraints are resolved correctly. Views use Move() for
+' their children, but anchor constraints only work on controls
+' that are direct children of a Window.
+' ============================================================
+
+Private Function CreateEditorWindow(app As LayoutEditorApp) As LayoutEditorWindow
+    Dim model As EditorModel = New EditorModel()
+
+    Dim win As LayoutEditorWindow = New LayoutEditorWindow()
+    win.App   = app
+    win.Title = "Buoy Layout Editor"
+    win.Move(60, 60, 980, 700)
+
+    Dim safe As LayoutProxy = win.SafeArea
+    Const LibW  As Double = 208.0
+    Const PropW As Double = 224.0
+    Const toolbarHeight As Double = 40.0
+    Const StatH As Double = 22.0
+    Const Gap   As Double = 4.0
+    Const StandardGap As Double = 8.0
+
+    Dim libList As LibListBox = New LibListBox()
+
+    ' ---- Status bar — pinned to window edges ----
+    Dim statusBar As Label = New Label()
+    statusBar.FontName = globalFontName
+    statusBar.FontSize = globalBoldFontSize
+    statusBar.Text = "Select a control from the library and click Add to place it on the canvas."
+    win.AddSubview(statusBar)
+    statusBar.BottomAnchor.EqualTo(safe.BottomAnchor).AddToParent(win)
+    statusBar.LeadingAnchor.EqualTo(safe.LeadingAnchor).AddToParent(win)
+    statusBar.TrailingAnchor.EqualTo(safe.TrailingAnchor).AddToParent(win)
+    statusBar.HeightAnchor.EqualTo(22).AddToParent(win)
+    statusBar.HeightAnchor.EqualTo(StatH).AddToParent(win)
+
+    Dim toolbar as View = New View()
+    win.AddSubview(toolbar)
+    toolbar.TopAnchor.EqualTo(safe.TopAnchor).AddToParent(win)
+    toolbar.LeadingAnchor.EqualTo(safe.LeadingAnchor).AddToParent(win)
+    toolbar.TrailingAnchor.EqualTo(safe.TrailingAnchor).AddToParent(win)
+    toolbar.HeightAnchor.EqualTo(toolbarHeight).AddToParent(win)
+
+    ' ---- Toolbar buttons — chained left-to-right from libList edge,
+    '      tops chained from appLabel so they track the title vertically ----
+    Dim gridChk As GridCheckbox = New GridCheckbox()
+    gridChk.Caption = "Grid"
+    gridChk.Value   = CheckState.True
+    win.AddSubview(gridChk)
+    gridChk.TopAnchor.EqualTo(toolbar.TopAnchor, standardgap).AddToParent(win)
+    gridChk.LeadingAnchor.EqualTo(toolbar.leadingAnchor, 20).AddToParent(win)
+    gridChk.WidthAnchor.EqualTo(60.0).AddToParent(win)
+    gridChk.HeightAnchor.EqualTo(22.0).AddToParent(win)
+
+    Dim addBtn As AddCtrlButton = New AddCtrlButton()
+    addBtn.Caption  = "Add"
+    addBtn.Status   = statusBar
+    addBtn.liblist = libList
+    win.AddSubview(addBtn)
+    addBtn.TopAnchor.EqualTo(gridChk.TopAnchor).AddToParent(win)
+    addBtn.LeadingAnchor.EqualTo(gridChk.TrailingAnchor, 8.0).AddToParent(win)
+    addBtn.WidthAnchor.EqualTo(60.0).AddToParent(win)
+    addBtn.HeightAnchor.EqualTo(30.0).AddToParent(win)
+
+    Dim delBtn As DeleteCtrlButton = New DeleteCtrlButton()
+    delBtn.Caption  = "Delete"
+    delBtn.Status   = statusBar
+    win.AddSubview(delBtn)
+    delBtn.TopAnchor.EqualTo(addBtn.TopAnchor).AddToParent(win)
+    delBtn.LeadingAnchor.EqualTo(addBtn.TrailingAnchor, 8.0).AddToParent(win)
+    delBtn.WidthAnchor.EqualTo(70.0).AddToParent(win)
+    delBtn.HeightAnchor.EqualTo(30.0).AddToParent(win)
+
+    dim leftPanel as View = New View()
+    win.AddSubview(leftPanel)
+    leftPanel.TopAnchor.EqualTo(toolbar.bottomAnchor).AddToParent(win)
+    leftPanel.LeadingAnchor.EqualTo(safe.LeadingAnchor).AddToParent(win)
+    leftPanel.WidthAnchor.EqualTo(LibW).AddToParent(win)
+    leftPanel.BottomAnchor.EqualTo(statusBar.TopAnchor, -Gap).AddToParent(win)
+
+    // ---- Library panel — header, search, list ----
+    // libHdr defines the top of the content band and the left indent.
+    // All other content-area controls chain their TopAnchor/LeadingAnchor from here.
+    Dim libHdr As Label = New Label()
+    libHdr.Text     = "Control Library"
+    libHdr.FontName = globalBoldFontName
+    libHdr.FontSize = globalBoldFontSize
+    win.AddSubview(libHdr)
+    libHdr.TopAnchor.EqualTo(leftPanel.TopAnchor).AddToParent(win)
+    libHdr.LeadingAnchor.EqualTo(leftPanel.LeadingAnchor).AddToParent(win)
+    libHdr.WidthAnchor.EqualTo(leftPanel.WidthAnchor).AddToParent(win)
+    libHdr.HeightAnchor.EqualTo(18.0).AddToParent(win)
+
+    Dim libSrc As LibrarySource = New LibrarySource()
+
+    Dim searchFld As LibSearchField = New LibSearchField()
+    searchFld.Placeholder = "Filter..."
+    win.AddSubview(searchFld)
+    searchFld.TopAnchor.EqualTo(libHdr.BottomAnchor, Gap).AddToParent(win)
+    searchFld.LeadingAnchor.EqualTo(libHdr.LeadingAnchor, -4.0).AddToParent(win)
+    searchFld.WidthAnchor.EqualTo(LibW - gap).AddToParent(win)
+    searchFld.HeightAnchor.EqualTo(24.0).AddToParent(win)
+
+    
+    libList.AddColumn("Control", LibW - 4.0)
+    libList.DefaultRowHeight = 26.0
+    libList.DataSource = libSrc
+    win.AddSubview(libList)
+    libList.TopAnchor.EqualTo(searchFld.BottomAnchor, standardgap).AddToParent(win)
+    libList.LeadingAnchor.EqualTo(leftPanel.LeadingAnchor).AddToParent(win)
+    libList.WidthAnchor.EqualTo(LibW).AddToParent(win)
+    libList.BottomAnchor.EqualTo(statusBar.TopAnchor, -standardgap).AddToParent(win)
+
+    searchFld.LibSrc  = libSrc
+    searchFld.LibList = libList
+    libList.ReloadData()
+
+    dim rightPanel as New View()
+    win.AddSubview(rightPanel)
+    rightPanel.TopAnchor.EqualTo(toolbar.bottomAnchor).AddToParent(win)
+    rightPanel.TrailingAnchor.EqualTo(safe.TrailingAnchor).AddToParent(win)
+    rightPanel.WidthAnchor.EqualTo(PropW).AddToParent(win)
+    rightPanel.BottomAnchor.EqualTo(statusBar.TopAnchor, -Gap).AddToParent(win)
+
+    ' ---- Property panel — header and list ----
+    ' propList uses an explicit LeadingAnchor so the canvas can reference it.
+    Dim propHdr As Label = New Label()
+    propHdr.Text     = "Properties"
+    propHdr.FontName = globalBoldFontName
+    propHdr.FontSize = globalBoldFontSize
+    win.AddSubview(propHdr)
+    propHdr.TopAnchor.EqualTo(rightPanel.TopAnchor).AddToParent(win)
+    propHdr.TrailingAnchor.EqualTo(rightPanel.TrailingAnchor).AddToParent(win)
+    propHdr.LeadingAnchor.EqualTo(rightPanel.LeadingAnchor).AddToParent(win)
+    propHdr.HeightAnchor.EqualTo(18.0).AddToParent(win)
+
+    Dim propList As ListBox = New ListBox()
+    propList.AddColumn("Property", 116.0)
+    propList.AddColumn("Value",    PropW - 120.0)
+    propList.DefaultRowHeight = 28.0
+    win.AddSubview(propList)
+    propList.TopAnchor.EqualTo(propHdr.bottomAnchor, Gap).AddToParent(win)
+    propList.LeadingAnchor.EqualTo(rightPanel.LeadingAnchor).AddToParent(win)
+    propList.WidthAnchor.EqualTo(PropW).AddToParent(win)
+    propList.BottomAnchor.EqualTo(rightPanel.BottomAnchor).AddToParent(win)
+
+    ' ---- Center — Design canvas ----
+    ' Leading sits directly against libList's right edge;
+    ' Trailing sits directly against propList's left edge.
+    ' Top aligns with the content band (same as libHdr/propHdr).
+    Dim surface As DesignCanvas = New DesignCanvas()
+    surface.Model    = model
+    surface.PropList = propList
+    surface.Status   = statusBar
+    win.AddSubview(surface)
+    surface.TopAnchor.EqualTo(toolbar.BottomAnchor).AddToParent(win)
+    surface.LeadingAnchor.EqualTo(leftPanel.TrailingAnchor, 1.0).AddToParent(win)
+    surface.TrailingAnchor.EqualTo(rightPanel.LeadingAnchor, -1.0).AddToParent(win)
+    surface.BottomAnchor.EqualTo(statusBar.TopAnchor, -Gap).AddToParent(win)
+
+    ' PropSource wired after surface exists
+    Dim propSrc As PropSource = New PropSource()
+    propSrc.Model   = model
+    propSrc.Surface = surface
+    propSrc.Status  = statusBar
+    propList.DataSource = propSrc
+    surface.PropSrc = propSrc
+    propList.ReloadData()
+
+    ' ---- Wire toolbar controls now that all components exist ----
+    gridChk.Model   = model
+    gridChk.Surface = surface
+
+    libList.LibSrc   = libSrc
+    libList.Model    = model
+    libList.Surface  = surface
+    libList.PropSrc  = propSrc
+    libList.PropList = propList
+    libList.Status   = statusBar
+
+    addBtn.LibSrc   = libSrc
+    addBtn.LibList  = libList
+    addBtn.Model    = model
+    addBtn.Surface  = surface
+    addBtn.PropSrc  = propSrc
+    addBtn.PropList = propList
+
+    delBtn.Model    = model
+    delBtn.Surface  = surface
+    delBtn.PropSrc  = propSrc
+    delBtn.PropList = propList
+
+    Dim docState As DocState = New DocState()
+
+    ' The File menu (Open / Save / Save As) acts through the window.
+    win.Model     = model
+    win.Surface   = surface
+    win.PropSrc   = propSrc
+    win.PropList  = propList
+    win.Status    = statusBar
+    win.Doc       = docState
+    propSrc.Doc   = docState
+    surface.Doc   = docState
+    addBtn.Doc    = docState
+    delBtn.Doc    = docState
+    libList.Doc   = docState
+
+    Return win
+End Function
+
+Sub Main()
+    Dim app As LayoutEditorApp = New LayoutEditorApp()
+    Dim win As LayoutEditorWindow = CreateEditorWindow(app)
+    app.CurrentWindow = win
+
+    Dim openItem As MenuItem = New MenuItem()
+    openItem.Caption = "Open…"
+    openItem.Tag = "open"
+
+    Dim saveItem As MenuItem = New MenuItem()
+    saveItem.Caption = "Save"
+    saveItem.Tag = "save"
+
+    Dim saveAsItem As MenuItem = New MenuItem()
+    saveAsItem.Caption = "Save As…"
+    saveAsItem.Tag = "saveas"
+
+    Dim quitItem As MenuItem = New MenuItem()
+    quitItem.Caption = "Quit"
+    quitItem.Tag = "quit"
+    #If TargetMac Then
+        openItem.Shortcut   = "Cmd+O"
+        saveItem.Shortcut   = "Cmd+S"
+        saveAsItem.Shortcut = "Cmd+Shift+S"
+    #Else
+        openItem.Shortcut   = "Ctrl+O"
+        saveItem.Shortcut   = "Ctrl+S"
+        saveAsItem.Shortcut = "Ctrl+Shift+S"
+        quitItem.Shortcut   = "Ctrl+Q"
+    #End If
+
+    Dim fileMenu As Menu = New Menu()
+    fileMenu.AddItem(openItem)
+    fileMenu.AddItem(saveItem)
+    fileMenu.AddItem(saveAsItem)
+    ' macOS provides Quit in the application menu (synthesized by the runtime);
+    ' Windows/Linux have no app menu, so keep Quit in File there.
+    #If TargetMac Then
+    #Else
+        fileMenu.AddItem(quitItem)
+    #End If
+
+    Dim bar As MenuBar = New MenuBar()
+    bar.AddMenu(fileMenu, "File")
+
+    ' On macOS the menu bar lives at the app level so it persists when all
+    ' windows are closed.  On Windows/Linux it belongs to the window; the
+    ' window's MenuSelected handler delegates back to app.HandleMenuItem.
+    #If TargetMac Then
+        app.MenuBar = bar
+    #Else
+        win.MenuBar = bar
+    #End If
+
+    win.Layout(980.0, 700.0)
+    win.Show()
+    application.Run()
+End Sub

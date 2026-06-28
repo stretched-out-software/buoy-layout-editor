@@ -1,0 +1,321 @@
+' ============================================================
+' LayoutDocument — the round-trip engine for the declarative `Window` layout
+' format (docs/research/window-blocks.md).
+'
+' EmitWindow serializes a LayoutDoc to a canonical `Public Window … End Window`
+' block (the same syntax the compiler lowers to a Window subclass), and
+' ParseWindow reads such a block back into a LayoutDoc. Emit is canonical and
+' parse preserves exactly the modeled fields, so a file the editor wrote round-
+' trips byte-for-byte: EmitWindow(Parse(Emit(doc))) == Emit(doc).
+'
+' Headless (no UI) so it can be unit-tested. The visual editor wraps it with
+' Open/Save actions.
+'
+' Lossiness (by design — the layout file is machine-owned): comments and any
+' property the model does not carry (colors, fonts, slider/checkbox values) are
+' dropped on the next save. Geometry is emitted as integers (the runtime layout
+' API is integer-only).
+' ============================================================
+
+Import LayoutModel
+
+' A parsed layout: the window identity + geometry and the control set.
+' A parsed layout: window identity + geometry, the control set, and a
+' success/error status. (Status is carried on the object rather than via a
+' `Result Of LayoutDoc, …` because returning a class wrapped in a Result hits a
+' compiler ARC bug — a Result payload that is a class reference is use-after-
+' freed by the caller. Result Of <primitive> is unaffected, so SaveLayout still
+' uses one.)
+Public Class LayoutDoc
+    Public Property WindowName  As String  = "MainWindow"
+    Public Property WindowTitle As String  = ""
+    ' Window frame is held as Double (matching the editor's canvas geometry) and
+    ' emitted rounded to whole pixels; the runtime layout API is integer-only.
+    Public Property WinX        As Double  = 200.0
+    Public Property WinY        As Double  = 200.0
+    Public Property WinW        As Double  = 480.0
+    Public Property WinH        As Double  = 320.0
+    Public Property Model       As EditorModel
+    Public Property Success     As Boolean = True   ' False if a parse/load failed
+    Public Property ErrMsg      As String  = ""     ' message when Success is False
+
+    Public Sub Constructor()
+        Me.Model = New EditorModel()
+    End Sub
+End Class
+
+' ── Formatting primitives ────────────────────────────────────────────────────
+
+' Line feed as a one-character string (Buoy has no newline string literal, and
+' a fixed LF keeps the output byte-stable on every platform).
+Private Function NL() As String
+    #if TargetWindows Then
+        Return String.Chr(13) + String.Chr(10)
+    #Else
+        Return String.Chr(10)
+    #End If
+End Function
+
+Private Function Quote() As String
+    Return String.Chr(34)
+End Function
+
+' Integer-clean text for a (grid-snapped) Double geometry value, e.g. 20.0 -> "20".
+Private Function IntStr(v As Double) As String
+    Return String.From(Math.Round(v))
+End Function
+
+' Double-quote a string value, escaping backslash then quote.
+Private Function Escape(s As String) As String
+    Dim r As String = String.Replace(s, "\\", "\\\\")
+    r = String.Replace(r, Quote(), "\\" + Quote())
+    Return Quote() + r + Quote()
+End Function
+
+' Inverse of Escape on the inner (already unquoted) text.
+Private Function Unescape(s As String) As String
+    Dim r As String = String.Replace(s, "\\" + Quote(), Quote())
+    r = String.Replace(r, "\\\\", "\\")
+    Return r
+End Function
+
+' ── Kind ↔ property-name mapping ─────────────────────────────────────────────
+
+' The property line that carries a control's caption/text, or "" for kinds with
+' no caption (Slider, ProgressBar, ListBox, ImageView, Canvas, View, TabView,
+' PagePanel — they have no scalar caption in the editor model).
+Public Function CaptionPropFor(kind As ControlKind) As String
+    If kind = ControlKind.LabelCtrl     Then Return "Text"
+    If kind = ControlKind.ButtonCtrl    Then Return "Caption"
+    If kind = ControlKind.TextFieldCtrl Then Return "Text"
+    If kind = ControlKind.TextAreaCtrl  Then Return "Text"
+    If kind = ControlKind.CheckboxCtrl  Then Return "Caption"
+    If kind = ControlKind.ComboBoxCtrl  Then Return "Text"
+    Return ""
+End Function
+
+' Reverse of DesignControl.KindName(). Unknown type names map to ViewCtrl so a
+' hand-edited / future control keeps its geometry instead of aborting the parse.
+Public Function KindFromName(typeName As String) As ControlKind
+    If typeName = "Label"       Then Return ControlKind.LabelCtrl
+    If typeName = "Button"      Then Return ControlKind.ButtonCtrl
+    If typeName = "TextField"   Then Return ControlKind.TextFieldCtrl
+    If typeName = "TextArea"    Then Return ControlKind.TextAreaCtrl
+    If typeName = "Checkbox"    Then Return ControlKind.CheckboxCtrl
+    If typeName = "Slider"      Then Return ControlKind.SliderCtrl
+    If typeName = "ProgressBar" Then Return ControlKind.ProgressCtrl
+    If typeName = "ComboBox"    Then Return ControlKind.ComboBoxCtrl
+    If typeName = "ListBox"     Then Return ControlKind.ListBoxCtrl
+    If typeName = "ImageView"   Then Return ControlKind.ImageCtrl
+    If typeName = "Canvas"      Then Return ControlKind.CanvasCtrl
+    If typeName = "TabView"     Then Return ControlKind.TabViewCtrl
+    If typeName = "PagePanel"   Then Return ControlKind.PagePanelCtrl
+    Return ControlKind.ViewCtrl
+End Function
+
+' ── Emitter ──────────────────────────────────────────────────────────────────
+
+Public Function EmitControl(c As DesignControl) As String
+    Dim out As String = "    Control " + c.KindName() + " " + c.Name + NL()
+    Dim capProp As String = CaptionPropFor(c.Kind)
+    If capProp <> "" Then
+        out = out + "        " + capProp + " = " + Escape(c.Caption) + NL()
+    End If
+    out = out + "        Frame = (" + IntStr(c.X) + ", " + IntStr(c.Y) + ", " _
+              + IntStr(c.W) + ", " + IntStr(c.H) + ")" + NL()
+    out = out + "    End Control" + NL()
+    Return out
+End Function
+
+Public Function EmitWindow(doc As LayoutDoc) As String
+    Dim out As String = "Public Window " + doc.WindowName + NL()
+    out = out + "    Title = " + Escape(doc.WindowTitle) + NL()
+    out = out + "    Frame = (" + IntStr(doc.WinX) + ", " + IntStr(doc.WinY) _
+              + ", " + IntStr(doc.WinW) + ", " + IntStr(doc.WinH) + ")" + NL()
+    Dim m As EditorModel = doc.Model
+    Dim i As Integer = 0
+    Do While i < m.Count()
+        out = out + NL()                       ' blank separator before each control
+        out = out + EmitControl(m.Get(i))
+        i = i + 1
+    Loop
+    out = out + "End Window" + NL()
+    Return out
+End Function
+
+Public Function SaveLayout(filePath As String, doc As LayoutDoc) As Result Of Integer, String
+    Return File.WriteAllText(filePath, EmitWindow(doc))
+End Function
+
+' ── Parser (tolerant line state machine) ─────────────────────────────────────
+
+' Split a line into non-empty whitespace-separated words.
+Private Function Words(line As String) As Array Of String
+    Dim raw As Array Of String = String.Split(line, " ")
+    Dim out As Array Of String = []
+    Dim k As Integer = 0
+    Do While k < Array.Count(raw)
+        Dim t As String = String.Trim(raw(k))
+        If t <> "" Then Array.Append(out, t)
+        k = k + 1
+    Loop
+    Return out
+End Function
+
+' Strip a trailing `'` comment, scanning quote-aware so an apostrophe inside a
+' string literal is never mistaken for a comment (and `\"` escapes don't end the
+' string early). Whole-line comments collapse to "" and are dropped by the main
+' loop's empty-line check.
+Private Function StripComment(line As String) As String
+    Dim n As Integer = String.Len(line)
+    Dim i As Integer = 0
+    Dim inStr As Boolean = False
+    Do While i < n
+        Dim ch As String = String.Substring(line, i, 1)
+        If inStr Then
+            If ch = "\\" Then
+                i = i + 1                       ' skip the escaped character
+            ElseIf ch = Quote() Then
+                inStr = False
+            End If
+        Else
+            If ch = Quote() Then
+                inStr = True
+            ElseIf ch = "'" Then
+                Return String.Left(line, i)
+            End If
+        End If
+        i = i + 1
+    Loop
+    Return line
+End Function
+
+' Parse "<lhs> = (a, b, c, d)" into 4 integers (missing/garbage → 0, padded to 4).
+Private Function ParseTuple(line As String) As Array Of Integer
+    Dim out As Array Of Integer = []
+    Dim lp As Integer = String.IndexOf(line, "(")
+    Dim rp As Integer = String.IndexOf(line, ")")
+    If lp >= 0 And rp > lp Then
+        Dim inner As String = String.Substring(line, lp + 1, rp - lp - 1)
+        Dim parts As Array Of String = String.Split(inner, ",")
+        Dim k As Integer = 0
+        Do While k < Array.Count(parts)
+            Array.Append(out, Integer.Parse(String.Trim(parts(k))).Or(0))
+            k = k + 1
+        Loop
+    End If
+    Do While Array.Count(out) < 4
+        Array.Append(out, 0)
+    Loop
+    Return out
+End Function
+
+' The string value of a `Name = "..."` line (quotes stripped + unescaped).
+Private Function PropValue(line As String) As String
+    Dim eq As Integer = String.IndexOf(line, "=")
+    If eq < 0 Then Return ""
+    Dim rhs As String = String.Trim(String.Substring(line, eq + 1, String.Len(line) - eq - 1))
+    If String.Len(rhs) >= 2 And String.StartsWith(rhs, Quote()) And String.EndsWith(rhs, Quote()) Then
+        rhs = String.Substring(rhs, 1, String.Len(rhs) - 2)
+        rhs = Unescape(rhs)
+    End If
+    Return rhs
+End Function
+
+Public Function ParseWindow(text As String) As LayoutDoc
+    Dim doc As LayoutDoc = New LayoutDoc()
+    Dim lines As Array Of String = String.Split(text, NL())
+
+    ' 0=TOP, 1=IN_WINDOW, 2=IN_CONTROL, 3=SKIP_BLOCK
+    Dim state As Integer = 0
+    Dim skipReturn As Integer = 1
+    Dim cur As DesignControl = Nil
+    Dim sawWindow As Boolean = False
+
+    Dim n As Integer = Array.Count(lines)
+    Dim i As Integer = 0
+    Do While i < n
+        Dim line As String = String.Trim(StripComment(lines(i)))
+        i = i + 1
+
+        If line = "" Then
+            ' blank / comment-only line — ignore
+        ElseIf state = 3 Then
+            ' Inside a skipped Constraints/Handle block: leave on its End line.
+            Dim w0 As Array Of String = Words(line)
+            If Array.Count(w0) >= 1 And w0(0) = "End" Then state = skipReturn
+        ElseIf state = 0 Then
+            Dim w As Array Of String = Words(line)
+            If Array.Count(w) >= 2 And w(0) = "Window" Then
+                doc.WindowName = w(1)
+                sawWindow = True
+                state = 1
+            ElseIf Array.Count(w) >= 3 And w(0) = "Public" And w(1) = "Window" Then
+                doc.WindowName = w(2)
+                sawWindow = True
+                state = 1
+            End If
+            ' anything else before the window header is ignored
+        ElseIf state = 1 Then
+            Dim w As Array Of String = Words(line)
+            Dim fw As String = w(0)
+            If fw = "Control" And Array.Count(w) >= 3 Then
+                cur = New DesignControl()
+                cur.Kind = KindFromName(w(1))
+                cur.Name = w(2)
+                state = 2
+            ElseIf fw = "End" And Array.Count(w) >= 2 And w(1) = "Window" Then
+                state = 0
+            ElseIf fw = "Constraints" Or fw = "Handle" Then
+                skipReturn = 1
+                state = 3
+            ElseIf fw = "Frame" Then
+                Dim t As Array Of Integer = ParseTuple(line)
+                doc.WinX = t(0)
+                doc.WinY = t(1)
+                doc.WinW = t(2)
+                doc.WinH = t(3)
+            ElseIf fw = "Title" Then
+                doc.WindowTitle = PropValue(line)
+            End If
+            ' any other `Name = value` window property is unmodeled — skipped
+        ElseIf state = 2 Then
+            Dim w As Array Of String = Words(line)
+            Dim fw As String = w(0)
+            If fw = "End" And Array.Count(w) >= 2 And w(1) = "Control" Then
+                If cur <> Nil Then doc.Model.Add(cur)
+                cur = Nil
+                state = 1
+            ElseIf fw = "Handle" Then
+                skipReturn = 2
+                state = 3
+            ElseIf fw = "Frame" Then
+                Dim t As Array Of Integer = ParseTuple(line)
+                If cur <> Nil Then
+                    cur.X = t(0)
+                    cur.Y = t(1)
+                    cur.W = t(2)
+                    cur.H = t(3)
+                End If
+            ElseIf fw = "Text" Or fw = "Caption" Then
+                If cur <> Nil Then cur.Caption = PropValue(line)
+            End If
+            ' any other control property is unmodeled — skipped
+        End If
+    Loop
+
+    If Not sawWindow Then
+        doc.Success = False
+        doc.ErrMsg  = "no Window block found"
+    End If
+    Return doc
+End Function
+
+Public Function LoadLayout(filePath As String) As LayoutDoc
+    Dim r As Result Of String, String = File.ReadAllText(filePath)
+    If r.IsOk Then Return ParseWindow(r.Value)
+    Dim doc As LayoutDoc = New LayoutDoc()
+    doc.Success = False
+    doc.ErrMsg  = r.Error
+    Return doc
+End Function
